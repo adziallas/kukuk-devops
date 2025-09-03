@@ -1,0 +1,79 @@
+pipeline {
+  agent any
+  options { timestamps(); buildDiscarder(logRotator(numToKeepStr: '20')); ansiColor('xterm') }
+  environment {
+    REGISTRY = 'registry.example.com/kukuk'
+    IMAGE_TAG = "${env.BUILD_NUMBER}"
+    DOCKER_BUILDKIT = '1'
+    PROFILE = 'dev'
+  }
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+    stage('Set Version & Info') { steps { sh 'java -version || true; node -v || true; mvn -v; echo "TAG=${IMAGE_TAG}"' } }
+    stage('Backend Build & Test') {
+      steps {
+        sh 'mvn -B -f backend/pom.xml -P${PROFILE} clean package'
+        junit 'backend/target/surefire-reports/*.xml'
+      }
+    }
+    stage('Frontend Build & Test') {
+      steps {
+        dir('frontend') {
+          sh 'npm ci'
+          sh 'npm test || true'
+          junit 'reports/jest-junit.xml'
+          sh 'npm run build'
+        }
+      }
+    }
+    stage('Docker Build & Push') {
+      steps {
+        sh '''
+          docker build -f docker/backend.Dockerfile -t ${REGISTRY}/backend:${IMAGE_TAG} -t ${REGISTRY}/backend:latest .
+          docker build -f docker/frontend.Dockerfile -t ${REGISTRY}/frontend:${IMAGE_TAG} -t ${REGISTRY}/frontend:latest .
+        '''
+        withCredentials([usernamePassword(credentialsId: 'cr-creds', usernameVariable: 'CR_USER', passwordVariable: 'CR_PASS')]) {
+          sh '''
+            echo "$CR_PASS" | docker login ${REGISTRY%/*} -u "$CR_USER" --password-stdin
+            docker push ${REGISTRY}/backend:${IMAGE_TAG}
+            docker push ${REGISTRY}/backend:latest
+            docker push ${REGISTRY}/frontend:${IMAGE_TAG}
+            docker push ${REGISTRY}/frontend:latest
+          '''
+        }
+      }
+    }
+    stage('Deploy Dev') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            export KUBECONFIG="$KUBECONFIG_FILE"
+            kustomize build k8s/overlays/dev | kubectl apply -f -
+            kubectl -n dev rollout restart deployment backend
+            kubectl -n dev rollout restart deployment frontend
+            kubectl -n dev rollout status deployment backend --timeout=120s
+            kubectl -n dev rollout status deployment frontend --timeout=120s
+          '''
+        }
+      }
+    }
+    stage('Manual Approval for Prod') {
+      steps { timeout(time: 1, unit: 'HOURS') { input message: "Prod-Deployment freigeben?" } }
+    }
+    stage('Deploy Prod') {
+      environment { PROFILE = 'prod' }
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            export KUBECONFIG="$KUBECONFIG_FILE"
+            kustomize build k8s/overlays/prod | kubectl apply -f -
+            kubectl -n prod set image deployment/backend backend=${REGISTRY}/backend:${IMAGE_TAG}
+            kubectl -n prod set image deployment/frontend frontend=${REGISTRY}/frontend:${IMAGE_TAG}
+            kubectl -n prod rollout status deployment backend --timeout=180s
+            kubectl -n prod rollout status deployment frontend --timeout=180s
+          '''
+        }
+      }
+    }
+  }
+}
