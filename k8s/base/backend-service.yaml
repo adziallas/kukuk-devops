@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  labels: { app: kukuk, tier: backend }
+spec:
+  selector: { app: kukuk, tier: backend }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
